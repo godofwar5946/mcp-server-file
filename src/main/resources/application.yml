@@ -1,0 +1,114 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    name: mcp-server-file
+
+  # ==========================
+  # Spring AI - MCP Server 配置
+  # ==========================
+  ai:
+    # 本项目作为 MCP Server 不依赖 OpenAI，这里默认关闭模型（none）
+    model:
+      chat: none
+      embedding: none
+      image: none
+      moderation: none
+      audio:
+        speech: none
+        transcription: none
+
+    mcp:
+      server:
+        enabled: true
+        name: file-mcp-server
+        version: 1.0.0
+        instructions: |
+          这是一个“文件读写 MCP Server”，默认只能访问 app.fs.roots 配置的目录（白名单）：
+          - fs_list_roots：列出允许访问的根目录（rootId + path）
+          - fs_list_directory：列出目录内容（非递归，支持 limit/offset 分页与 glob 过滤；支持 refresh=true 强制刷新缓存）
+          - fs_list_tree：递归列出目录树（支持 maxDepth/maxEntries；可 includeFiles=false 只返回目录）
+          - fs_read_file：读取文件内容（文本 utf-8 / 二进制 base64，可按 maxBytes 截断）
+          - fs_read_file_lines：按行读取（用于分片拉取完整文本，降低被客户端截断的概率）
+          - fs_read_file_filtered：筛选读取（按行号范围/关键字/正则，返回行号+文本，可选上下文；避免整文件返回）
+          - fs_read_file_range：按字节范围读取（base64，用于分片拉取任意文件）
+          - fs_find_by_name：按名称定位文件/目录（优先缓存，未命中或 refresh=true 时回退扫描并更新缓存）
+          - fs_search：搜索文件/目录（返回匹配行号+片段，不返回整文件，适合大文件/避免截断）
+          - fs_prepare_patch_file：按规则生成补丁写入（正则替换/插入/删除/按行处理；不直接写入，需 confirm）
+          - fs_prepare_write_file -> fs_confirm_write_file：两段式写入确认（confirm=true 才会真正写入）
+        type: SYNC
+        protocol: STREAMABLE
+        streamable-http:
+          mcp-endpoint: /mcp
+          keep-alive-interval: 15s
+          disallow-delete: true
+
+app:
+  fs:
+    # 允许访问的根目录白名单（建议按需改为你希望暴露给 MCP 的目录）
+    roots:
+      - D:\java\demo
+
+    # 列表分页：默认与上限（避免一次列出超大目录导致性能/网络压力）
+    list-default-limit: 200
+    list-max-limit: 5000
+
+    # 目录树：递归列出层级时的默认深度/上限、默认条目数/上限（用于 fs_list_tree）
+    tree-default-depth: 8
+    tree-max-depth: 32
+    tree-default-entries: 10000
+    tree-max-entries: 50000
+
+    # 读取文件：最大读取字节数（超出则截断并返回 truncated=true）
+    read-max-bytes: 1MB
+
+    # 分片读取：用于规避部分 MCP 客户端/LLM 对超长工具输出的截断展示（如插入 “… chars truncated …”）
+    # - fs_read_file_range：按字节范围分片读取（base64）
+    # - fs_read_file_lines：按行分片读取（文本）
+    read-range-default-bytes: 64KB
+    read-range-max-bytes: 256KB
+    read-lines-default-max-lines: 200
+    read-lines-max-lines: 2000
+
+    # 搜索：只返回命中“行号+片段”，避免整文件返回导致客户端截断
+    search-default-max-matches: 200
+    search-max-matches: 5000
+    search-default-max-files: 2000
+    search-max-files: 20000
+    search-default-max-depth: 20
+    search-max-depth: 100
+    search-max-line-length: 400
+
+    # 补丁：单次 patch 允许的最大操作数（上限保护）
+    patch-max-operations: 200
+
+    # 索引/缓存：用于减少重复 IO，提高大目录/深层目录下的“找文件/列目录”性能
+    cache-enabled: true
+    # 文件名索引缓存：按文件名快速定位路径（同名文件会返回多个候选）
+    cache-name-index-ttl: 30m
+    cache-name-index-max-names: 200000
+    cache-name-index-max-paths-per-name: 50
+    # 目录列表缓存：缓存某次 fs_list_directory 的结果（包含分页/过滤参数）；写入后会尽量失效相关目录
+    cache-directory-ttl: 30m
+    cache-directory-max-entries: 10000
+
+    # 写入确认：token 存活时间、单次待写入内容最大字节数
+    pending-write-ttl: 10m
+    pending-write-max-bytes: 5MB
+
+    # 文件变更检测：在 prepare 阶段计算旧文件 sha256 的最大文件大小（超出则跳过 stale check）
+    hash-max-bytes: 32MB
+
+    include-hidden-by-default: false
+    allow-write: true
+    allow-symlink: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,env,loggers,threaddump
+  endpoint:
+    health:
+      show-details: always

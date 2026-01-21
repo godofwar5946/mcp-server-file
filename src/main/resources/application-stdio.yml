@@ -1,0 +1,19 @@
+# ==========================
+# stdio 模式（给 Codex / 其他 MCP 客户端通过进程 stdin/stdout 连接使用）
+# ==========================
+spring:
+  main:
+    # stdio 连接不需要 HTTP 服务，关闭 Web 容器，避免额外线程与日志干扰
+    web-application-type: none
+
+  ai:
+    mcp:
+      server:
+        # 开启 stdio 传输后，spring-ai 会自动禁用 WebMVC SSE 传输（避免冲突）
+        stdio: true
+
+logging:
+  # stdio 模式下：日志输出到 STDERR（避免污染 stdout 的 MCP 协议输出）
+  level:
+    root: INFO
+

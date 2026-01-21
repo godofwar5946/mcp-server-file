@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!--
+      重要说明：
+      - MCP 的 stdio 传输使用 stdout 作为协议输出通道
+      - 因此在 stdio profile 下，我们把普通日志输出到 STDERR，避免破坏协议数据
+    -->
+
+    <springProfile name="stdio">
+        <appender name="CONSOLE_ERR" class="ch.qos.logback.core.ConsoleAppender">
+            <target>System.err</target>
+            <encoder>
+                <charset>UTF-8</charset>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_ERR"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="!stdio">
+        <appender name="CONSOLE_OUT" class="ch.qos.logback.core.ConsoleAppender">
+            <target>System.out</target>
+            <encoder>
+                <charset>UTF-8</charset>
+                <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{36} - %msg%n</pattern>
+            </encoder>
+        </appender>
+        <root level="INFO">
+            <appender-ref ref="CONSOLE_OUT"/>
+        </root>
+    </springProfile>
+</configuration>
