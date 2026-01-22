@@ -24,6 +24,10 @@ import org.example.filesystem.dto.FileWriteConfirmResult;
 import org.example.filesystem.dto.FileWritePrepareResult;
 import org.example.filesystem.dto.NameResolveEntry;
 import org.example.filesystem.dto.NameResolveResult;
+import org.example.filesystem.dto.StepModelInfoResult;
+import org.example.filesystem.dto.step.StepEntityListResult;
+import org.example.filesystem.step.StepDataAnalyzer;
+import org.example.filesystem.step.StepModelInfoParser;
 import org.springframework.ai.tool.annotation.Tool;
 import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.stereotype.Component;
@@ -33,7 +37,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringReader;
+import java.nio.CharBuffer;
+import java.nio.charset.Charset;
 import java.nio.charset.CodingErrorAction;
+import java.nio.charset.CoderResult;
 import java.nio.charset.StandardCharsets;
 import java.nio.ByteBuffer;
 import java.nio.channels.SeekableByteChannel;
@@ -58,6 +65,7 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -103,6 +111,28 @@ public class FileMcpTools {
             ".ts", ".tsx", ".jsx", ".sh", ".bat", ".cmd", ".ps1", ".toml", ".ini", ".csv",
             ".log", ".conf"
     );
+
+    /**
+     * STEP 模型信息解析的字节扫描上限。
+     * <p>
+     * 说明：
+     * <ul>
+     *   <li>解析装配/几何/尺寸等信息需要扫描 DATA 段，而 DATA 往往远大于 HEADER。</li>
+     *   <li>默认扫描 16MB 以覆盖多数中小模型；超大模型可通过工具参数 maxBytes 提升。</li>
+     *   <li>设置硬上限 128MB，避免一次调用把超大文件全部读入内存。</li>
+     * </ul>
+     */
+    private static final long STEP_MODEL_INFO_DEFAULT_MAX_BYTES = 16L * 1024 * 1024;
+    private static final long STEP_MODEL_INFO_MAX_BYTES = 128L * 1024 * 1024;
+
+    /**
+     * STEP DATA 段实体扫描上限（控制解析工作量）。
+     * <p>
+     * DATA 段实体通常形如：{@code #123=ENTITY_NAME(...);}，大型模型可能有数百万条。
+     * 这里通过实体数量上限保护 CPU/内存与响应时间；需要更完整结果时可调大 maxEntities，但仍有硬上限保护。
+     */
+    private static final long STEP_DATA_DEFAULT_MAX_ENTITIES = 500_000L;
+    private static final long STEP_DATA_MAX_ENTITIES = 5_000_000L;
 
     /**
      * patch/search 参数解析用的 JSON 解析器。
@@ -601,6 +631,184 @@ public class FileMcpTools {
                 sha256,
                 lastModifiedAt,
                 text,
+                warnings.isEmpty() ? null : warnings
+        );
+    }
+
+    @Tool(
+            name = "fs_read_step_model_info",
+            description = "解析 STEP(.stp/.step) 文件的模型信息：HEADER( FILE_DESCRIPTION/FILE_NAME/FILE_SCHEMA ) + DATA(装配层级/零件BOM/尺寸与PMI摘要/几何与拓扑摘要)。支持中文（含 \\\\X2\\\\...\\\\X0\\\\ 编码）。"
+    )
+    public StepModelInfoResult readStepModelInfo(
+            @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
+            @ToolParam(description = "STEP 文件路径（.stp/.step，相对 rootId 或绝对路径）") String path,
+            @ToolParam(required = false, description = "最大扫描字节数（默认 16MB，上限 128MB；仅用于解析，不会原样返回文件内容）") Long maxBytes,
+            @ToolParam(required = false, description = "最大扫描实体数（默认 500000，上限 5000000；用于控制 DATA 段解析工作量）") Long maxEntities
+    ) {
+        SecurePathResolver.ResolvedPath resolved = pathResolver.resolve(rootId, path, true);
+        Path file = resolved.absolutePath();
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("不是普通文件：" + resolved.displayPath());
+        }
+
+        // STEP 文件扩展名校验：避免误把普通文本/二进制文件当 STEP 来解析。
+        String fileName = file.getFileName() != null ? file.getFileName().toString() : resolved.displayPath();
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        if (!lower.endsWith(".stp") && !lower.endsWith(".step")) {
+            throw new IllegalArgumentException("不是 STEP 文件（仅支持 .stp/.step）：" + resolved.displayPath());
+        }
+
+        long totalBytes;
+        try {
+            totalBytes = Files.size(file);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取文件大小失败：" + resolved.displayPath(), e);
+        }
+
+        // 为了避免把超大 STEP 文件一次性读入内存，这里只读取前 maxBytes 字节用于解析。
+        long resolvedMaxBytes = resolveStepModelInfoMaxBytes(maxBytes);
+        byte[] bytes = readUpTo(file, resolvedMaxBytes);
+        boolean truncated = totalBytes > bytes.length;
+
+        List<String> warnings = new ArrayList<>();
+        // STEP 文件在中文环境里可能是 UTF-8，也可能是 GBK/GB18030。
+        // - UTF-8：直接解码
+        // - 非 UTF-8：尝试用 GB18030 解码（替换非法字符），并在 warnings 里提示
+        DecodedText decoded = decodeStepText(bytes, truncated, warnings);
+
+        // 解析 HEADER：FILE_DESCRIPTION/FILE_NAME/FILE_SCHEMA + 少量 PRODUCT 名称（作为模型/零件名线索）
+        StepModelInfoParser.StepModelInfo info = StepModelInfoParser.parse(decoded.text());
+        if (info.warnings() != null) {
+            warnings.addAll(info.warnings());
+        }
+
+        // 解析 DATA：抽取 BOM/装配/几何&拓扑摘要/尺寸&PMI 摘要。
+        // 注意：这不是“完整 STEP 几何内核”，但能覆盖很多工程上常用的元信息提取需求。
+        StepDataAnalyzer.Limits baseLimits = StepDataAnalyzer.Limits.defaults();
+        long resolvedMaxEntities = resolveStepDataMaxEntities(maxEntities);
+        StepDataAnalyzer.Limits dataLimits = new StepDataAnalyzer.Limits(
+                resolvedMaxEntities,
+                baseLimits.maxTopEntityTypes(),
+                baseLimits.maxParts(),
+                baseLimits.maxAssemblyDepth(),
+                baseLimits.maxAssemblyNodes(),
+                baseLimits.maxPmiSnippets(),
+                baseLimits.maxMeasures()
+        );
+        StepDataAnalyzer.Analysis data = StepDataAnalyzer.analyze(decoded.text(), dataLimits);
+        if (data.warnings() != null) {
+            warnings.addAll(data.warnings());
+        }
+        if (truncated) {
+            addWarningLimited(warnings, "已按 maxBytes 截断扫描，模型信息可能不完整；如需更多信息可增大 maxBytes。");
+        }
+
+        return new StepModelInfoResult(
+                resolved.rootId(),
+                normalizeDisplayPath(resolved.displayPath()),
+                truncated,
+                decoded.decodedWith(),
+                info.fileDescriptions(),
+                info.implementationLevel(),
+                info.fileName(),
+                info.timeStamp(),
+                info.authors(),
+                info.organizations(),
+                info.preprocessorVersion(),
+                info.originatingSystem(),
+                info.authorization(),
+                info.schemas(),
+                info.productNames(),
+                data.entitiesParsed(),
+                data.entitiesTruncated(),
+                data.topEntityTypes(),
+                data.parts(),
+                data.assemblyRelations(),
+                data.assemblyTree(),
+                data.geometry(),
+                data.topology(),
+                data.pmi(),
+                warnings.isEmpty() ? null : warnings
+        );
+    }
+
+    @Tool(
+            name = "fs_read_step_entities",
+            description = "分页列出 STEP(.stp/.step) 的 DATA 段实体（可按实体类型关键字过滤）。返回的实体文本会尽量解码中文（含 \\\\X2\\\\...\\\\X0\\\\）。"
+    )
+    public StepEntityListResult readStepEntities(
+            @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
+            @ToolParam(description = "STEP 文件路径（.stp/.step，相对 rootId 或绝对路径）") String path,
+            @ToolParam(required = false, description = "实体类型过滤关键字（大小写不敏感；例如 DIMENSION / B_SPLINE / PRODUCT / ADVANCED_FACE 等）") String typeContains,
+            @ToolParam(required = false, description = "匹配偏移（0-based；默认 0）") Integer offset,
+            @ToolParam(required = false, description = "返回条数（默认 50；上限 500）") Integer limit,
+            @ToolParam(required = false, description = "最大扫描字节数（默认 16MB，上限 128MB）") Long maxBytes,
+            @ToolParam(required = false, description = "最大扫描实体数（默认 500000，上限 5000000；用于控制 DATA 段扫描工作量）") Long maxEntities
+    ) {
+        SecurePathResolver.ResolvedPath resolved = pathResolver.resolve(rootId, path, true);
+        Path file = resolved.absolutePath();
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalArgumentException("不是普通文件：" + resolved.displayPath());
+        }
+
+        // 工具定位：
+        // - fs_read_step_model_info：返回“摘要/结构化信息”（BOM/装配树/摘要计数等）
+        // - fs_read_step_entities ：返回“原始实体片段”（用于更进一步的精细解析）
+        //
+        // 这里提供分页 + typeContains 过滤，避免一次性返回过多内容导致客户端截断。
+        String fileName = file.getFileName() != null ? file.getFileName().toString() : resolved.displayPath();
+        String lower = fileName.toLowerCase(Locale.ROOT);
+        if (!lower.endsWith(".stp") && !lower.endsWith(".step")) {
+            throw new IllegalArgumentException("不是 STEP 文件（仅支持 .stp/.step）：" + resolved.displayPath());
+        }
+
+        long totalBytes;
+        try {
+            totalBytes = Files.size(file);
+        } catch (IOException e) {
+            throw new IllegalStateException("读取文件大小失败：" + resolved.displayPath(), e);
+        }
+
+        long resolvedMaxBytes = resolveStepModelInfoMaxBytes(maxBytes);
+        byte[] bytes = readUpTo(file, resolvedMaxBytes);
+        boolean truncated = totalBytes > bytes.length;
+
+        List<String> warnings = new ArrayList<>();
+        DecodedText decoded = decodeStepText(bytes, truncated, warnings);
+
+        // 按实体类型关键字进行“包含匹配”过滤：
+        // 例如 typeContains="DIMENSION" 会匹配 DIMENSIONAL_SIZE / DIMENSION_CURVE 等。
+        StepDataAnalyzer.Limits baseLimits = StepDataAnalyzer.Limits.defaults();
+        long resolvedMaxEntities = resolveStepDataMaxEntities(maxEntities);
+        StepDataAnalyzer.Limits scanLimits = new StepDataAnalyzer.Limits(
+                resolvedMaxEntities,
+                baseLimits.maxTopEntityTypes(),
+                baseLimits.maxParts(),
+                baseLimits.maxAssemblyDepth(),
+                baseLimits.maxAssemblyNodes(),
+                baseLimits.maxPmiSnippets(),
+                baseLimits.maxMeasures()
+        );
+        StepDataAnalyzer.EntityList list = StepDataAnalyzer.listEntities(decoded.text(), scanLimits, typeContains, offset, limit);
+        if (list.warnings() != null) {
+            warnings.addAll(list.warnings());
+        }
+        if (truncated) {
+            addWarningLimited(warnings, "已按 maxBytes 截断扫描；如需更多实体请增大 maxBytes。");
+        }
+
+        return new StepEntityListResult(
+                resolved.rootId(),
+                normalizeDisplayPath(resolved.displayPath()),
+                truncated,
+                decoded.decodedWith(),
+                list.scannedEntities(),
+                list.entitiesTruncated(),
+                list.offset(),
+                list.limit(),
+                list.hasMore(),
+                list.nextOffset(),
+                list.entities(),
                 warnings.isEmpty() ? null : warnings
         );
     }
@@ -2127,6 +2335,18 @@ public class FileMcpTools {
         return Math.min(resolved, properties.getReadMaxBytes().toBytes());
     }
 
+    private long resolveStepModelInfoMaxBytes(Long maxBytes) {
+        long resolved = (maxBytes == null) ? STEP_MODEL_INFO_DEFAULT_MAX_BYTES : maxBytes;
+        resolved = Math.max(1, resolved);
+        return Math.min(resolved, STEP_MODEL_INFO_MAX_BYTES);
+    }
+
+    private long resolveStepDataMaxEntities(Long maxEntities) {
+        long resolved = (maxEntities == null) ? STEP_DATA_DEFAULT_MAX_ENTITIES : maxEntities;
+        resolved = Math.max(1L, resolved);
+        return Math.min(resolved, STEP_DATA_MAX_ENTITIES);
+    }
+
     private int resolveReadRangeMaxBytes(Integer maxBytes) {
         // 分片读取（按字节范围）上限保护：避免一次返回过大被客户端截断/占用过多内存
         long resolved = (maxBytes == null) ? properties.getReadRangeDefaultBytes().toBytes() : maxBytes.longValue();
@@ -2304,6 +2524,74 @@ public class FileMcpTools {
         try {
             decoder.decode(java.nio.ByteBuffer.wrap(bytes));
             return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private record DecodedText(String text, String decodedWith) {
+    }
+
+    private static DecodedText decodeStepText(byte[] bytes, boolean truncated, List<String> warnings) {
+        if (bytes == null || bytes.length == 0) {
+            return new DecodedText("", "utf-8");
+        }
+        if (isValidUtf8(bytes)) {
+            return new DecodedText(decodeUtf8BestEffort(bytes), "utf-8");
+        }
+
+        // STEP 文件扫描通常会按 maxBytes 截断；如果原文件是 UTF-8，则截断点可能刚好落在多字节字符中间，
+        // 这会导致严格的 UTF-8 校验失败。
+        // 这里做一个“前缀 UTF-8”判断：允许末尾存在不完整的 UTF-8 序列（UNDERFLOW），但不允许中间出现非法字节序列（ERROR）。
+        if (truncated && isUtf8PrefixAllowTruncatedTail(bytes)) {
+            addWarningLimited(warnings, "STEP 内容被 maxBytes 截断，末尾可能存在不完整 UTF-8 序列；已按 UTF-8 尽力解码。");
+            return new DecodedText(decodeUtf8BestEffort(bytes), "utf-8");
+        }
+
+        Charset charset;
+        try {
+            charset = Charset.forName("GB18030");
+        } catch (Exception e) {
+            charset = Charset.defaultCharset();
+        }
+
+        var decoder = charset.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPLACE)
+                .onUnmappableCharacter(CodingErrorAction.REPLACE);
+
+        String text;
+        try {
+            text = decoder.decode(ByteBuffer.wrap(bytes)).toString();
+        } catch (Exception e) {
+            text = new String(bytes, charset);
+        }
+
+        addWarningLimited(warnings, "文件不是有效 UTF-8，已使用 " + charset.name() + " 尝试解码。");
+        return new DecodedText(text, charset.name().toLowerCase(Locale.ROOT));
+    }
+
+    private static boolean isUtf8PrefixAllowTruncatedTail(byte[] bytes) {
+        // 说明：
+        // - endOfInput=false 会把“末尾不完整序列”视为 UNDERFLOW（可接受），而不是 ERROR。
+        // - 这样可以区分“真正的非 UTF-8 文件”（中间会出现 ERROR）与“UTF-8 但被截断”的情况。
+        var decoder = StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT);
+        try {
+            ByteBuffer in = ByteBuffer.wrap(bytes);
+            CharBuffer out = CharBuffer.allocate(4096);
+            while (true) {
+                CoderResult r = decoder.decode(in, out, false);
+                if (r.isError()) {
+                    return false;
+                }
+                if (r.isOverflow()) {
+                    out.clear();
+                    continue;
+                }
+                // UNDERFLOW：输入耗尽（或末尾不完整），都认为“前缀是合法 UTF-8”。
+                return true;
+            }
         } catch (Exception e) {
             return false;
         }
