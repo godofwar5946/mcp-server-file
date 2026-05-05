@@ -10,6 +10,8 @@ import org.example.filesystem.SecurePathResolver;
 import org.example.filesystem.dto.AllowedRootsResult;
 import org.example.filesystem.dto.DirectoryListResult;
 import org.example.filesystem.dto.FileEntry;
+import org.example.filesystem.dto.FilePatchApplyResult;
+import org.example.filesystem.dto.FilePatchPreview;
 import org.example.filesystem.dto.FilePatchPrepareResult;
 import org.example.filesystem.dto.FileReadFilteredLine;
 import org.example.filesystem.dto.FileReadFilteredResult;
@@ -1660,7 +1662,7 @@ public class FileMcpTools {
 
     @Tool(
             name = "fs_prepare_patch_file",
-            description = "按规则对文本文件生成补丁写入（正则替换/插入/删除/按行处理）；不直接写入，返回 token；需再调用 fs_confirm_write_file(confirm=true) 才会真正写入。"
+            description = "按规则对文本文件生成补丁写入；支持整文件替换、锚点块替换、按行处理、Java 方法体替换/节点替换；不直接写入，返回 token 和修改后上下文；需再调用 fs_confirm_write_file(confirm=true) 才会真正写入。"
     )
     /**
      * 对“已存在的 UTF-8 文本文件”执行 patch 规则，并生成待写入内容。
@@ -1673,10 +1675,14 @@ public class FileMcpTools {
      * <p>
      * patch 入参格式：JSON 数组，每个元素是一条操作。支持的操作类型：
      * <ul>
+     *   <li>{@code {"type":"replace_entire","text":"..."}}</li>
+     *   <li>{@code {"type":"replace_block","startAnchor":"...","endAnchor":"...","newText":"...","includeAnchors":true}}</li>
      *   <li>{@code {"type":"regex_replace","pattern":"...","replacement":"...","flags":"i","maxReplacements":0}}</li>
      *   <li>{@code {"type":"insert_lines","atLine":10,"position":"before","text":"a\\nb"}}</li>
      *   <li>{@code {"type":"delete_lines","fromLine":10,"toLine":20}}</li>
      *   <li>{@code {"type":"line_regex","pattern":"...","action":"delete|replace|insert_before|insert_after","replacement":"...","text":"...","flags":"i","maxEdits":0,"occurrence":0}}</li>
+     *   <li>{@code {"type":"java_method_replace_body","className":"Demo","methodName":"run","parameterTypes":["String"],"newBody":"..."}}</li>
+     *   <li>{@code {"type":"java_node_replace","nodeType":"class|method|statement","className":"Demo","methodName":"run","replacementText":"..."}}</li>
      * </ul>
      * <p>
      * 安全性：
@@ -1688,8 +1694,159 @@ public class FileMcpTools {
     public FilePatchPrepareResult preparePatchFile(
             @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
             @ToolParam(description = "目标文件路径（相对 rootId 或绝对路径）") String path,
-            @ToolParam(description = "patch 规则（JSON 数组，支持 regex_replace/insert_lines/delete_lines/line_regex）") String patch
+            @ToolParam(description = "patch 规则（JSON 数组，支持 replace_entire/replace_block/regex_replace/insert_lines/delete_lines/line_regex/java_method_replace_body/java_node_replace）") String patch,
+            @ToolParam(required = false, description = "是否返回每步摘要（默认 false；为节省 LLM token 建议保持 false）") Boolean includeSummaries,
+            @ToolParam(required = false, description = "是否返回修改前后预览片段（默认 false；为节省 LLM token 建议保持 false）") Boolean includePreviews,
+            @ToolParam(required = false, description = "最多返回多少个预览片段（默认 3，上限 20；仅 includePreviews=true 生效）") Integer maxPreviews,
+            @ToolParam(required = false, description = "每个预览片段前后保留多少行上下文（默认 1，上限 5；仅 includePreviews=true 生效）") Integer previewContextLines
     ) {
+        return preparePatchFileInternal(rootId, path, patch, PatchResultViewOptions.of(includeSummaries, includePreviews, maxPreviews, previewContextLines));
+    }
+
+    @Tool(
+            name = "fs_prepare_read_modify_write_file",
+            description = "一次 prepare 调用内完成“读取当前文本 -> 应用修改操作 -> 生成待确认写入”；支持整文件替换、锚点块替换、Java 方法/类节点替换；需再调用 fs_confirm_write_file(confirm=true) 才会真正写入。"
+    )
+    public FilePatchPrepareResult prepareReadModifyWriteFile(
+            @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
+            @ToolParam(description = "目标文件路径（相对 rootId 或绝对路径）") String path,
+            @ToolParam(description = "修改操作（JSON 数组，和 fs_prepare_patch_file 相同）") String operations,
+            @ToolParam(required = false, description = "是否返回每步摘要（默认 false；为节省 LLM token 建议保持 false）") Boolean includeSummaries,
+            @ToolParam(required = false, description = "是否返回修改前后预览片段（默认 false；为节省 LLM token 建议保持 false）") Boolean includePreviews,
+            @ToolParam(required = false, description = "最多返回多少个预览片段（默认 3，上限 20；仅 includePreviews=true 生效）") Integer maxPreviews,
+            @ToolParam(required = false, description = "每个预览片段前后保留多少行上下文（默认 1，上限 5；仅 includePreviews=true 生效）") Integer previewContextLines
+    ) {
+        return preparePatchFileInternal(rootId, path, operations, PatchResultViewOptions.of(includeSummaries, includePreviews, maxPreviews, previewContextLines));
+    }
+
+    @Tool(
+            name = "fs_apply_patch_file",
+            description = "一次调用内完成“读取当前文本 -> 应用 patch -> 校验旧版本 -> 原子写回”；支持整文件替换、锚点块替换、按行处理、Java 方法体替换/节点替换；不再需要 confirm。"
+    )
+    public FilePatchApplyResult applyPatchFile(
+            @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
+            @ToolParam(description = "目标文件路径（相对 rootId 或绝对路径）") String path,
+            @ToolParam(description = "patch 规则（JSON 数组，和 fs_prepare_patch_file 相同）") String patch,
+            @ToolParam(required = false, description = "是否返回每步摘要（默认 false；为节省 LLM token 建议保持 false）") Boolean includeSummaries,
+            @ToolParam(required = false, description = "是否返回修改前后预览片段（默认 false；为节省 LLM token 建议保持 false）") Boolean includePreviews,
+            @ToolParam(required = false, description = "最多返回多少个预览片段（默认 3，上限 20；仅 includePreviews=true 生效）") Integer maxPreviews,
+            @ToolParam(required = false, description = "每个预览片段前后保留多少行上下文（默认 1，上限 5；仅 includePreviews=true 生效）") Integer previewContextLines
+    ) {
+        return applyPatchFileInternal(rootId, path, patch, PatchResultViewOptions.of(includeSummaries, includePreviews, maxPreviews, previewContextLines));
+    }
+
+    @Tool(
+            name = "fs_apply_read_modify_write_file",
+            description = "一次调用内完成“读取当前文本 -> 应用修改操作 -> 校验旧版本 -> 原子写回”；支持整文件替换、锚点块替换、Java 方法/类节点替换；不再需要 confirm。"
+    )
+    public FilePatchApplyResult applyReadModifyWriteFile(
+            @ToolParam(required = false, description = "rootId（可从 fs_list_roots 获取；为空默认 root0）") String rootId,
+            @ToolParam(description = "目标文件路径（相对 rootId 或绝对路径）") String path,
+            @ToolParam(description = "修改操作（JSON 数组，和 fs_prepare_patch_file 相同）") String operations,
+            @ToolParam(required = false, description = "是否返回每步摘要（默认 false；为节省 LLM token 建议保持 false）") Boolean includeSummaries,
+            @ToolParam(required = false, description = "是否返回修改前后预览片段（默认 false；为节省 LLM token 建议保持 false）") Boolean includePreviews,
+            @ToolParam(required = false, description = "最多返回多少个预览片段（默认 3，上限 20；仅 includePreviews=true 生效）") Integer maxPreviews,
+            @ToolParam(required = false, description = "每个预览片段前后保留多少行上下文（默认 1，上限 5；仅 includePreviews=true 生效）") Integer previewContextLines
+    ) {
+        return applyPatchFileInternal(rootId, path, operations, PatchResultViewOptions.of(includeSummaries, includePreviews, maxPreviews, previewContextLines));
+    }
+
+    private FilePatchPrepareResult preparePatchFileInternal(String rootId, String path, String patch, PatchResultViewOptions viewOptions) {
+        PatchExecutionResult execution = computePatchExecution(rootId, path, patch, viewOptions);
+        if (!execution.changed()) {
+            return new FilePatchPrepareResult(
+                    null,
+                    execution.rootId(),
+                    execution.path(),
+                    false,
+                    true,
+                    execution.newBytes().length,
+                    execution.expectedSha256(),
+                    execution.newSha256(),
+                    null,
+                    execution.operations(),
+                    execution.replacements(),
+                    execution.insertedLines(),
+                    execution.deletedLines(),
+                    nullableList(execution.summaries()),
+                    firstPreview(execution.previews()),
+                    nullableList(execution.previews()),
+                    nullableList(execution.warnings())
+            );
+        }
+
+        PendingFileWriteStore.PendingFileWrite pending = pendingWriteStore.create(
+                execution.rootId(),
+                execution.path(),
+                execution.target(),
+                execution.newBytes(),
+                true,
+                false,
+                true,
+                execution.expectedSha256(),
+                execution.newSha256()
+        );
+
+        return new FilePatchPrepareResult(
+                pending.token(),
+                pending.rootId(),
+                pending.displayPath(),
+                true,
+                true,
+                execution.newBytes().length,
+                execution.expectedSha256(),
+                execution.newSha256(),
+                pending.expiresAt(),
+                execution.operations(),
+                execution.replacements(),
+                execution.insertedLines(),
+                execution.deletedLines(),
+                nullableList(execution.summaries()),
+                firstPreview(execution.previews()),
+                nullableList(execution.previews()),
+                nullableList(execution.warnings())
+        );
+    }
+
+    private FilePatchApplyResult applyPatchFileInternal(String rootId, String path, String patch, PatchResultViewOptions viewOptions) {
+        PatchExecutionResult execution = computePatchExecution(rootId, path, patch, viewOptions);
+        List<String> warnings = new ArrayList<>(execution.warnings());
+        Instant wroteAt = null;
+        long bytesWritten = 0L;
+        if (!execution.changed()) {
+            warnings.add("补丁未产生任何变化：无需写入。");
+        } else {
+            wroteAt = writeExistingFileAtomically(
+                    execution.rootId(),
+                    execution.path(),
+                    execution.target(),
+                    execution.newBytes(),
+                    execution.expectedSha256(),
+                    execution.newSha256(),
+                    warnings
+            );
+            bytesWritten = execution.newBytes().length;
+        }
+        return new FilePatchApplyResult(
+                execution.rootId(),
+                execution.path(),
+                execution.changed(),
+                bytesWritten,
+                execution.expectedSha256(),
+                execution.newSha256(),
+                wroteAt,
+                execution.operations(),
+                execution.replacements(),
+                execution.insertedLines(),
+                execution.deletedLines(),
+                nullableList(execution.summaries()),
+                firstPreview(execution.previews()),
+                nullableList(execution.previews()),
+                nullableList(warnings)
+        );
+    }
+
+    private PatchExecutionResult computePatchExecution(String rootId, String path, String patch, PatchResultViewOptions viewOptions) {
         if (!properties.isAllowWrite()) {
             throw new IllegalStateException("已禁止写入：配置 app.fs.allow-write=false");
         }
@@ -1713,7 +1870,6 @@ public class FileMcpTools {
             throw new IllegalStateException("读取文件大小失败：" + resolved.displayPath(), e);
         }
 
-        // 补丁在服务端内存中生成新内容，并会暂存到 pending store，因此受 pending-write-max-bytes 限制。
         long maxPendingBytes = properties.getPendingWriteMaxBytes().toBytes();
         if (fileSize > maxPendingBytes) {
             throw new IllegalArgumentException(
@@ -1732,234 +1888,40 @@ public class FileMcpTools {
             throw new IllegalArgumentException("文件不是 UTF-8 文本，无法按文本 patch：" + resolved.displayPath());
         }
 
-        boolean endsWithNewline = originalBytes.length > 0 && originalBytes[originalBytes.length - 1] == (byte) '\n';
-        String eol = detectEol(target);
         String originalText = new String(originalBytes, StandardCharsets.UTF_8);
-
-        List<String> lines = new ArrayList<>();
-        try (BufferedReader reader = new BufferedReader(new StringReader(originalText))) {
-            String line;
-            while ((line = reader.readLine()) != null) {
-                lines.add(line);
-            }
-        } catch (IOException e) {
-            // StringReader 理论上不会抛 IOException，但这里保留兜底
-            throw new IllegalStateException("解析文本内容失败：" + resolved.displayPath(), e);
-        }
-
-        JsonNode rootNode;
-        try {
-            rootNode = OBJECT_MAPPER.readTree(patch);
-        } catch (Exception e) {
-            throw new IllegalArgumentException("patch 不是合法的 JSON：" + e.getMessage(), e);
-        }
-        if (rootNode == null || !rootNode.isArray()) {
-            throw new IllegalArgumentException("patch 格式错误：必须是 JSON 数组");
-        }
-        if (rootNode.size() > properties.getPatchMaxOperations()) {
-            throw new IllegalArgumentException("patch 操作数过多：" + rootNode.size() + "（上限 " + properties.getPatchMaxOperations() + "）");
-        }
+        TextDocument document = TextDocument.from(target, originalBytes, originalText);
+        JsonNode rootNode = parsePatchOperations(patch);
 
         int operations = 0;
         int replacements = 0;
         int insertedLines = 0;
         int deletedLines = 0;
-        List<String> summaries = new ArrayList<>();
+        List<String> summaries = viewOptions.includeSummaries() ? new ArrayList<>() : List.of();
         List<String> warnings = new ArrayList<>();
+        List<FilePatchPreview> previews = viewOptions.includePreviews() ? new ArrayList<>() : List.of();
 
         for (JsonNode op : rootNode) {
             operations++;
-            String type = requiredText(op, "type");
-            switch (type) {
-                case "regex_replace" -> {
-                    String patternText = requiredText(op, "pattern");
-                    String replacement = requiredTextAllowEmpty(op, "replacement");
-                    if (containsNewline(replacement)) {
-                        throw new IllegalArgumentException("regex_replace 的 replacement 不允许包含换行符（请改用 insert_lines/line_regex 实现多行变更）");
-                    }
-                    String flagsText = optionalText(op, "flags");
-                    int maxReplacements = optionalPositiveInt(op, "maxReplacements", 0);
-                    Pattern compiled = compilePattern(patternText, flagsText, false);
-
-                    int remaining = maxReplacements;
-                    int opReplacements = 0;
-                    int changedLineCount = 0;
-                    for (int i = 0; i < lines.size(); i++) {
-                        if (maxReplacements > 0 && remaining <= 0) {
-                            break;
-                        }
-                        ReplaceResult rr = replaceAndCount(lines.get(i), compiled, replacement, remaining);
-                        if (rr.count() > 0) {
-                            opReplacements += rr.count();
-                            remaining = (maxReplacements > 0) ? Math.max(0, remaining - rr.count()) : remaining;
-                            if (!rr.text().equals(lines.get(i))) {
-                                lines.set(i, rr.text());
-                                changedLineCount++;
-                            }
-                        }
-                    }
-                    replacements += opReplacements;
-                    summaries.add("regex_replace：替换次数=" + opReplacements + "，影响行数=" + changedLineCount);
-                }
-                case "insert_lines" -> {
-                    int atLine = requiredPositiveInt(op, "atLine");
-                    String position = optionalText(op, "position");
-                    String text = requiredTextAllowEmpty(op, "text");
-                    List<String> insert = splitToLines(text);
-                    if (insert.isEmpty()) {
-                        summaries.add("insert_lines：插入 0 行（忽略）");
-                        break;
-                    }
-
-                    String pos = (position == null || position.isBlank()) ? "before" : position.trim().toLowerCase();
-                    int index;
-                    if ("before".equals(pos)) {
-                        if (atLine < 1 || atLine > lines.size() + 1) {
-                            throw new IllegalArgumentException("insert_lines 的 atLine 超出范围：atLine=" + atLine + "，允许范围 1.." + (lines.size() + 1));
-                        }
-                        index = atLine - 1;
-                    } else if ("after".equals(pos)) {
-                        if (atLine < 1 || atLine > lines.size()) {
-                            throw new IllegalArgumentException("insert_lines 的 atLine 超出范围（after 只能插在现有行之后）：atLine=" + atLine + "，允许范围 1.." + lines.size());
-                        }
-                        index = atLine;
-                    } else {
-                        throw new IllegalArgumentException("insert_lines 的 position 不支持：" + position + "（请使用 before/after）");
-                    }
-
-                    lines.addAll(index, insert);
-                    insertedLines += insert.size();
-                    summaries.add("insert_lines：插入行数=" + insert.size() + "，位置=" + pos + "，atLine=" + atLine);
-                }
-                case "delete_lines" -> {
-                    int fromLine = requiredPositiveInt(op, "fromLine");
-                    int toLine = optionalPositiveInt(op, "toLine", fromLine);
-                    if (toLine < fromLine) {
-                        throw new IllegalArgumentException("delete_lines 的 toLine 不能小于 fromLine：" + fromLine + ".." + toLine);
-                    }
-                    if (fromLine < 1 || fromLine > lines.size()) {
-                        throw new IllegalArgumentException("delete_lines 的 fromLine 超出范围：fromLine=" + fromLine + "，允许范围 1.." + lines.size());
-                    }
-                    if (toLine > lines.size()) {
-                        throw new IllegalArgumentException("delete_lines 的 toLine 超出范围：toLine=" + toLine + "，允许范围 1.." + lines.size());
-                    }
-                    int count = toLine - fromLine + 1;
-                    lines.subList(fromLine - 1, toLine).clear();
-                    deletedLines += count;
-                    summaries.add("delete_lines：删除行数=" + count + "，范围=" + fromLine + ".." + toLine);
-                }
-                case "line_regex" -> {
-                    String patternText = requiredText(op, "pattern");
-                    String action = requiredText(op, "action").trim().toLowerCase();
-                    String flagsText = optionalText(op, "flags");
-                    int maxEdits = optionalPositiveInt(op, "maxEdits", 0);
-                    int occurrence = optionalPositiveInt(op, "occurrence", 0);
-                    Pattern compiled = compilePattern(patternText, flagsText, false);
-
-                    int edits = 0;
-                    int matchCount = 0;
-                    int localInserted = 0;
-                    int localDeleted = 0;
-
-                    for (int i = 0; i < lines.size(); i++) {
-                        if (maxEdits > 0 && edits >= maxEdits) {
-                            break;
-                        }
-                        String line = lines.get(i);
-                        Matcher m = compiled.matcher(line);
-                        if (!m.find()) {
-                            continue;
-                        }
-                        matchCount++;
-                        if (occurrence > 0 && matchCount != occurrence) {
-                            continue;
-                        }
-
-                        switch (action) {
-                            case "delete" -> {
-                                lines.remove(i);
-                                i--;
-                                edits++;
-                                localDeleted++;
-                                if (occurrence > 0) {
-                                    i = lines.size(); // 提前结束
-                                }
-                            }
-                            case "replace" -> {
-                                String replacement = requiredTextAllowEmpty(op, "replacement");
-                                List<String> replLines = splitToLines(replacement);
-                                if (replLines.isEmpty()) {
-                                    // 替换为空视为删除该行
-                                    lines.remove(i);
-                                    i--;
-                                    edits++;
-                                    localDeleted++;
-                                    if (occurrence > 0) {
-                                        i = lines.size();
-                                    }
-                                    break;
-                                }
-                                // 支持“用多行替换一行”：先删原行，再插入新行
-                                lines.remove(i);
-                                lines.addAll(i, replLines);
-                                i += replLines.size() - 1;
-                                edits++;
-                                localDeleted++;
-                                localInserted += replLines.size();
-                                if (occurrence > 0) {
-                                    i = lines.size();
-                                }
-                            }
-                            case "insert_before" -> {
-                                String text = requiredTextAllowEmpty(op, "text");
-                                List<String> insert = splitToLines(text);
-                                if (!insert.isEmpty()) {
-                                    lines.addAll(i, insert);
-                                    i += insert.size(); // 跳过插入内容，避免重复触发
-                                    edits++;
-                                    localInserted += insert.size();
-                                }
-                                if (occurrence > 0) {
-                                    i = lines.size();
-                                }
-                            }
-                            case "insert_after" -> {
-                                String text = requiredTextAllowEmpty(op, "text");
-                                List<String> insert = splitToLines(text);
-                                if (!insert.isEmpty()) {
-                                    lines.addAll(i + 1, insert);
-                                    i += insert.size(); // 跳过插入内容
-                                    edits++;
-                                    localInserted += insert.size();
-                                }
-                                if (occurrence > 0) {
-                                    i = lines.size();
-                                }
-                            }
-                            default -> throw new IllegalArgumentException("line_regex 的 action 不支持：" + action + "（请使用 delete/replace/insert_before/insert_after）");
-                        }
-                    }
-
-                    insertedLines += localInserted;
-                    deletedLines += localDeleted;
-                    summaries.add("line_regex：action=" + action + "，命中行数=" + matchCount + "，编辑次数=" + edits + "，插入行=" + localInserted + "，删除行=" + localDeleted);
-                }
-                default -> throw new IllegalArgumentException("不支持的 patch 操作 type：" + type);
+            String beforeText = document.text();
+            OperationEffect effect = applyPatchOperation(document, op);
+            replacements += effect.replacements();
+            insertedLines += effect.insertedLines();
+            deletedLines += effect.deletedLines();
+            if (viewOptions.includeSummaries()) {
+                summaries.add(effect.summary());
+            }
+            if (viewOptions.includePreviews() && !Objects.equals(beforeText, document.text())) {
+                collectPatchPreviews(previews, beforeText, document.text(), document.eol(), viewOptions.maxPreviews(), viewOptions.previewContextLines());
             }
         }
 
-        String newText = joinLines(lines, eol, endsWithNewline);
+        String newText = document.text();
         byte[] newBytes = newText.getBytes(StandardCharsets.UTF_8);
         if (newBytes.length > maxPendingBytes) {
             throw new IllegalArgumentException("补丁生成后的内容过大：" + newBytes.length + " 字节（上限 " + maxPendingBytes + "）");
         }
 
         boolean changed = !Arrays.equals(originalBytes, newBytes);
-        if (!changed) {
-            warnings.add("补丁未产生任何变化：无需确认写入。");
-        }
-
-        // 计算旧文件 sha256（可选）：用于 confirm 阶段做“是否被外部修改”校验
         String expectedSha256 = null;
         try {
             if (fileSize <= properties.getHashMaxBytes().toBytes()) {
@@ -1971,57 +1933,21 @@ public class FileMcpTools {
             warnings.add("计算现有文件 sha256 失败，跳过校验：" + e.getMessage());
         }
 
-        String newSha256 = HashingUtils.sha256Hex(newBytes);
-
-        // changed=false 时不创建 token，避免无意义写入导致文件时间戳变化
-        if (!changed) {
-            return new FilePatchPrepareResult(
-                    null,
-                    resolved.rootId(),
-                    normalizeDisplayPath(resolved.displayPath()),
-                    false,
-                    true,
-                    newBytes.length,
-                    expectedSha256,
-                    newSha256,
-                    null,
-                    operations,
-                    replacements,
-                    insertedLines,
-                    deletedLines,
-                    summaries.isEmpty() ? null : summaries,
-                    warnings.isEmpty() ? null : warnings
-            );
-        }
-
-        PendingFileWriteStore.PendingFileWrite pending = pendingWriteStore.create(
+        return new PatchExecutionResult(
                 resolved.rootId(),
                 normalizeDisplayPath(resolved.displayPath()),
                 target,
-                newBytes,
-                true,
-                false,
-                true,
+                changed,
                 expectedSha256,
-                newSha256
-        );
-
-        return new FilePatchPrepareResult(
-                pending.token(),
-                pending.rootId(),
-                pending.displayPath(),
-                true,
-                true,
-                newBytes.length,
-                expectedSha256,
-                newSha256,
-                pending.expiresAt(),
+                HashingUtils.sha256Hex(newBytes),
                 operations,
                 replacements,
                 insertedLines,
                 deletedLines,
-                summaries.isEmpty() ? null : summaries,
-                warnings.isEmpty() ? null : warnings
+                newBytes,
+                summaries,
+                previews,
+                warnings
         );
     }
 
@@ -2304,6 +2230,1057 @@ public class FileMcpTools {
                 Instant.now(),
                 warnings.isEmpty() ? null : warnings
         );
+    }
+
+    private JsonNode parsePatchOperations(String patch) {
+        JsonNode rootNode;
+        try {
+            rootNode = OBJECT_MAPPER.readTree(patch);
+        } catch (Exception e) {
+            throw new IllegalArgumentException("patch 不是合法的 JSON：" + e.getMessage(), e);
+        }
+        if (rootNode == null || !rootNode.isArray()) {
+            throw new IllegalArgumentException("patch 格式错误：必须是 JSON 数组");
+        }
+        if (rootNode.size() > properties.getPatchMaxOperations()) {
+            throw new IllegalArgumentException("patch 操作数过多：" + rootNode.size() + "（上限 " + properties.getPatchMaxOperations() + "）");
+        }
+        return rootNode;
+    }
+
+    private OperationEffect applyPatchOperation(TextDocument document, JsonNode op) {
+        String type = requiredText(op, "type");
+        return switch (type) {
+            case "replace_entire" -> {
+                String newText = requiredTextAllowEmpty(op, "text");
+                document.setText(newText);
+                yield new OperationEffect(0, 0, 0, "replace_entire：已替换整文件内容");
+            }
+            case "replace_block" -> {
+                BlockReplaceResult result = replaceBlock(document.text(), op);
+                document.setText(result.text());
+                yield new OperationEffect(0, 0, 0,
+                        "replace_block：范围=" + result.replacedStart() + ".." + result.replacedEnd()
+                                + "，includeAnchors=" + result.includeAnchors());
+            }
+            case "regex_replace" -> applyRegexReplace(document, op);
+            case "insert_lines" -> applyInsertLines(document, op);
+            case "delete_lines" -> applyDeleteLines(document, op);
+            case "line_regex" -> applyLineRegex(document, op);
+            case "java_method_replace_body" -> {
+                JavaMethodReplaceResult result = replaceJavaMethodBody(document.text(), op);
+                document.setText(result.text());
+                yield new OperationEffect(0, 0, 0,
+                        "java_method_replace_body：method=" + result.methodName()
+                                + (result.className() == null ? "" : "，class=" + result.className()));
+            }
+            case "java_node_replace" -> {
+                JavaNodeReplaceResult result = replaceJavaNode(document.text(), op);
+                document.setText(result.text());
+                yield new OperationEffect(0, 0, 0,
+                        "java_node_replace：nodeType=" + result.nodeType() + "，name=" + result.nodeName());
+            }
+            default -> throw new IllegalArgumentException("不支持的 patch 操作 type：" + type);
+        };
+    }
+
+    private static OperationEffect applyRegexReplace(TextDocument document, JsonNode op) {
+        String patternText = requiredText(op, "pattern");
+        String replacement = requiredTextAllowEmpty(op, "replacement");
+        if (containsNewline(replacement)) {
+            throw new IllegalArgumentException("regex_replace 的 replacement 不允许包含换行符（请改用 insert_lines/line_regex 实现多行变更）");
+        }
+        String flagsText = optionalText(op, "flags");
+        int maxReplacements = optionalPositiveInt(op, "maxReplacements", 0);
+        Pattern compiled = compilePattern(patternText, flagsText, false);
+        List<String> lines = document.lines();
+
+        int remaining = maxReplacements;
+        int opReplacements = 0;
+        int changedLineCount = 0;
+        for (int i = 0; i < lines.size(); i++) {
+            if (maxReplacements > 0 && remaining <= 0) {
+                break;
+            }
+            ReplaceResult rr = replaceAndCount(lines.get(i), compiled, replacement, remaining);
+            if (rr.count() > 0) {
+                opReplacements += rr.count();
+                remaining = (maxReplacements > 0) ? Math.max(0, remaining - rr.count()) : remaining;
+                if (!rr.text().equals(lines.get(i))) {
+                    lines.set(i, rr.text());
+                    changedLineCount++;
+                }
+            }
+        }
+        document.setLines(lines);
+        return new OperationEffect(opReplacements, 0, 0,
+                "regex_replace：替换次数=" + opReplacements + "，影响行数=" + changedLineCount);
+    }
+
+    private static OperationEffect applyInsertLines(TextDocument document, JsonNode op) {
+        List<String> lines = document.lines();
+        int atLine = requiredPositiveInt(op, "atLine");
+        String position = optionalText(op, "position");
+        String text = requiredTextAllowEmpty(op, "text");
+        List<String> insert = splitToLines(text);
+        if (insert.isEmpty()) {
+            return new OperationEffect(0, 0, 0, "insert_lines：插入 0 行（忽略）");
+        }
+
+        String pos = (position == null || position.isBlank()) ? "before" : position.trim().toLowerCase();
+        int index;
+        if ("before".equals(pos)) {
+            if (atLine < 1 || atLine > lines.size() + 1) {
+                throw new IllegalArgumentException("insert_lines 的 atLine 超出范围：atLine=" + atLine + "，允许范围 1.." + (lines.size() + 1));
+            }
+            index = atLine - 1;
+        } else if ("after".equals(pos)) {
+            if (atLine < 1 || atLine > lines.size()) {
+                throw new IllegalArgumentException("insert_lines 的 atLine 超出范围（after 只能插在现有行之后）：atLine=" + atLine + "，允许范围 1.." + lines.size());
+            }
+            index = atLine;
+        } else {
+            throw new IllegalArgumentException("insert_lines 的 position 不支持：" + position + "（请使用 before/after）");
+        }
+
+        lines.addAll(index, insert);
+        document.setLines(lines);
+        return new OperationEffect(0, insert.size(), 0,
+                "insert_lines：插入行数=" + insert.size() + "，位置=" + pos + "，atLine=" + atLine);
+    }
+
+    private static OperationEffect applyDeleteLines(TextDocument document, JsonNode op) {
+        List<String> lines = document.lines();
+        int fromLine = requiredPositiveInt(op, "fromLine");
+        int toLine = optionalPositiveInt(op, "toLine", fromLine);
+        if (toLine < fromLine) {
+            throw new IllegalArgumentException("delete_lines 的 toLine 不能小于 fromLine：" + fromLine + ".." + toLine);
+        }
+        if (fromLine < 1 || fromLine > lines.size()) {
+            throw new IllegalArgumentException("delete_lines 的 fromLine 超出范围：fromLine=" + fromLine + "，允许范围 1.." + lines.size());
+        }
+        if (toLine > lines.size()) {
+            throw new IllegalArgumentException("delete_lines 的 toLine 超出范围：toLine=" + toLine + "，允许范围 1.." + lines.size());
+        }
+        int count = toLine - fromLine + 1;
+        lines.subList(fromLine - 1, toLine).clear();
+        document.setLines(lines);
+        return new OperationEffect(0, 0, count,
+                "delete_lines：删除行数=" + count + "，范围=" + fromLine + ".." + toLine);
+    }
+
+    private static OperationEffect applyLineRegex(TextDocument document, JsonNode op) {
+        List<String> lines = document.lines();
+        String patternText = requiredText(op, "pattern");
+        String action = requiredText(op, "action").trim().toLowerCase();
+        String flagsText = optionalText(op, "flags");
+        int maxEdits = optionalPositiveInt(op, "maxEdits", 0);
+        int occurrence = optionalPositiveInt(op, "occurrence", 0);
+        Pattern compiled = compilePattern(patternText, flagsText, false);
+
+        int edits = 0;
+        int matchCount = 0;
+        int localInserted = 0;
+        int localDeleted = 0;
+
+        for (int i = 0; i < lines.size(); i++) {
+            if (maxEdits > 0 && edits >= maxEdits) {
+                break;
+            }
+            String line = lines.get(i);
+            Matcher m = compiled.matcher(line);
+            if (!m.find()) {
+                continue;
+            }
+            matchCount++;
+            if (occurrence > 0 && matchCount != occurrence) {
+                continue;
+            }
+
+            switch (action) {
+                case "delete" -> {
+                    lines.remove(i);
+                    i--;
+                    edits++;
+                    localDeleted++;
+                    if (occurrence > 0) {
+                        i = lines.size();
+                    }
+                }
+                case "replace" -> {
+                    String replacement = requiredTextAllowEmpty(op, "replacement");
+                    List<String> replLines = splitToLines(replacement);
+                    if (replLines.isEmpty()) {
+                        lines.remove(i);
+                        i--;
+                        edits++;
+                        localDeleted++;
+                        if (occurrence > 0) {
+                            i = lines.size();
+                        }
+                        break;
+                    }
+                    lines.remove(i);
+                    lines.addAll(i, replLines);
+                    i += replLines.size() - 1;
+                    edits++;
+                    localDeleted++;
+                    localInserted += replLines.size();
+                    if (occurrence > 0) {
+                        i = lines.size();
+                    }
+                }
+                case "insert_before" -> {
+                    String text = requiredTextAllowEmpty(op, "text");
+                    List<String> insert = splitToLines(text);
+                    if (!insert.isEmpty()) {
+                        lines.addAll(i, insert);
+                        i += insert.size();
+                        edits++;
+                        localInserted += insert.size();
+                    }
+                    if (occurrence > 0) {
+                        i = lines.size();
+                    }
+                }
+                case "insert_after" -> {
+                    String text = requiredTextAllowEmpty(op, "text");
+                    List<String> insert = splitToLines(text);
+                    if (!insert.isEmpty()) {
+                        lines.addAll(i + 1, insert);
+                        i += insert.size();
+                        edits++;
+                        localInserted += insert.size();
+                    }
+                    if (occurrence > 0) {
+                        i = lines.size();
+                    }
+                }
+                default -> throw new IllegalArgumentException("line_regex 的 action 不支持：" + action + "（请使用 delete/replace/insert_before/insert_after）");
+            }
+        }
+
+        document.setLines(lines);
+        return new OperationEffect(0, localInserted, localDeleted,
+                "line_regex：action=" + action + "，命中行数=" + matchCount + "，编辑次数=" + edits + "，插入行=" + localInserted + "，删除行=" + localDeleted);
+    }
+
+    private Instant writeExistingFileAtomically(
+            String rootId,
+            String displayPath,
+            Path target,
+            byte[] bytes,
+            String expectedSha256,
+            String newSha256,
+            List<String> warnings
+    ) {
+        if (!properties.isAllowSymlink() && Files.isSymbolicLink(target)) {
+            throw new IllegalArgumentException("不允许写入到符号链接目标路径：" + displayPath);
+        }
+        if (!Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalStateException("提交失败：目标文件在读取后发生变化（现在已不存在）");
+        }
+        if (expectedSha256 != null) {
+            try {
+                String currentSha = HashingUtils.sha256Hex(target);
+                if (!expectedSha256.equalsIgnoreCase(currentSha)) {
+                    throw new IllegalStateException("提交失败：目标文件内容已被修改（sha256 不一致）");
+                }
+            } catch (IOException e) {
+                warnings.add("校验现有文件 sha256 失败，将继续执行：" + e.getMessage());
+            }
+        }
+        if (!Files.isDirectory(target.getParent(), LinkOption.NOFOLLOW_LINKS)) {
+            throw new IllegalStateException("父目录不存在：" + normalizeDisplayPath(target.getParent().toString()));
+        }
+        try {
+            writeAtomically(target, bytes, true);
+        } catch (IOException e) {
+            throw new IllegalStateException("写入文件失败：" + displayPath, e);
+        }
+        refreshCachesAfterWrite(rootId, target, displayPath, warnings);
+        return Instant.now();
+    }
+
+    private void refreshCachesAfterWrite(String rootId, Path target, String displayPath, List<String> warnings) {
+        if (indexCache != null && indexCache.isEnabled()) {
+            try {
+                indexCache.recordName(
+                        rootId,
+                        fileName(target),
+                        normalizeDisplayPath(displayPath),
+                        false,
+                        true
+                );
+
+                Path parent = target.getParent();
+                if (parent != null) {
+                    SecurePathResolver.ResolvedPath resolvedNow = pathResolver.resolve(rootId, target.toString(), false);
+                    String parentRel = normalizeBasePath(safeRel(resolvedNow.rootPath(), parent));
+                    indexCache.recordName(
+                            rootId,
+                            fileName(parent),
+                            parentRel,
+                            true,
+                            false
+                    );
+                    indexCache.invalidateDirectoryLists(rootId, parentRel);
+                }
+            } catch (Exception e) {
+                warnings.add("写入后更新缓存失败（不影响写入结果）：" + e.getMessage());
+            }
+        }
+    }
+
+    private static BlockReplaceResult replaceBlock(String text, JsonNode op) {
+        String startAnchor = requiredTextAllowEmpty(op, "startAnchor");
+        String endAnchor = requiredTextAllowEmpty(op, "endAnchor");
+        String newText = requiredTextAllowEmpty(op, "newText");
+        boolean caseSensitive = optionalBoolean(op, "caseSensitive", true);
+        int startOccurrence = optionalPositiveInt(op, "startOccurrence", 1);
+        int endOccurrence = optionalPositiveInt(op, "endOccurrence", 1);
+        boolean includeAnchors = optionalBoolean(op, "includeAnchors", true);
+        return replaceBlock(text, startAnchor, endAnchor, newText, caseSensitive, startOccurrence, endOccurrence, includeAnchors);
+    }
+
+    private static BlockReplaceResult replaceBlock(
+            String text,
+            String startAnchor,
+            String endAnchor,
+            String newText,
+            boolean caseSensitive,
+            int startOccurrence,
+            int endOccurrence,
+            boolean includeAnchors
+    ) {
+        // 先定位起始锚点；后续默认从它后面继续找结束锚点，避免误命中前面的同名片段。
+        int start = indexOfOccurrence(text, startAnchor, 0, startOccurrence, caseSensitive);
+        if (start < 0) {
+            throw new IllegalArgumentException("replace_block 未找到 startAnchor");
+        }
+        int searchFrom = start + startAnchor.length();
+        int end;
+        // 单语句替换时常见 start/end 锚点相同，此时直接把该命中视为整段范围。
+        if (Objects.equals(startAnchor, endAnchor) && includeAnchors && endOccurrence == 1) {
+            end = start;
+        } else {
+            end = indexOfOccurrence(text, endAnchor, searchFrom, endOccurrence, caseSensitive);
+        }
+        if (end < 0) {
+            throw new IllegalArgumentException("replace_block 未找到 endAnchor");
+        }
+        int replaceStart = includeAnchors ? start : searchFrom;
+        int replaceEnd = includeAnchors ? end + endAnchor.length() : end;
+        if (replaceEnd < replaceStart) {
+            throw new IllegalArgumentException("replace_block 锚点范围非法");
+        }
+        String updated = text.substring(0, replaceStart) + newText + text.substring(replaceEnd);
+        return new BlockReplaceResult(updated, replaceStart, replaceEnd, includeAnchors);
+    }
+
+    private static JavaMethodReplaceResult replaceJavaMethodBody(String text, JsonNode op) {
+        String className = optionalText(op, "className");
+        String methodName = requiredText(op, "methodName");
+        List<String> parameterTypes = optionalTextArray(op, "parameterTypes");
+        // 这里先做“方法块定位”，再只替换花括号内部内容，方法签名/注解/修饰符保持不变。
+        MethodBlock method = locateMethodBlock(text, className, methodName, parameterTypes);
+        String newBody = requiredTextAllowEmpty(op, "newBody");
+        String updated = replaceJavaMethodBody(text, method, newBody);
+        return new JavaMethodReplaceResult(updated, className, methodName);
+    }
+
+    private static JavaNodeReplaceResult replaceJavaNode(String text, JsonNode op) {
+        String nodeType = requiredText(op, "nodeType").trim().toLowerCase(Locale.ROOT);
+        String replacementText = requiredTextAllowEmpty(op, "replacementText");
+        return switch (nodeType) {
+            case "class" -> {
+                String className = requiredText(op, "className");
+                BlockRange block = locateClassBlock(text, className);
+                String updated = text.substring(0, block.startInclusive()) + replacementText + text.substring(block.endExclusive());
+                yield new JavaNodeReplaceResult(updated, nodeType, className);
+            }
+            case "method" -> {
+                String className = optionalText(op, "className");
+                String methodName = requiredText(op, "methodName");
+                List<String> parameterTypes = optionalTextArray(op, "parameterTypes");
+                MethodBlock method = locateMethodBlock(text, className, methodName, parameterTypes);
+                String updated = text.substring(0, method.declarationStart()) + replacementText + text.substring(method.endExclusive());
+                yield new JavaNodeReplaceResult(updated, nodeType, methodName);
+            }
+            case "statement" -> {
+                String className = optionalText(op, "className");
+                String methodName = requiredText(op, "methodName");
+                List<String> parameterTypes = optionalTextArray(op, "parameterTypes");
+                MethodBlock method = locateMethodBlock(text, className, methodName, parameterTypes);
+                // statement 模式只在目标方法体内部做锚点块替换，避免跨方法漂移。
+                String bodyText = text.substring(method.bodyStart(), method.bodyEndExclusive());
+                String startAnchor = requiredTextAllowEmpty(op, "startAnchor");
+                String endAnchor = requiredTextAllowEmpty(op, "endAnchor");
+                boolean caseSensitive = optionalBoolean(op, "caseSensitive", true);
+                int startOccurrence = optionalPositiveInt(op, "startOccurrence", 1);
+                int endOccurrence = optionalPositiveInt(op, "endOccurrence", 1);
+                boolean includeAnchors = optionalBoolean(op, "includeAnchors", true);
+                BlockReplaceResult bodyReplace = replaceBlock(bodyText, startAnchor, endAnchor, replacementText, caseSensitive, startOccurrence, endOccurrence, includeAnchors);
+                String updated = text.substring(0, method.bodyStart()) + bodyReplace.text() + text.substring(method.bodyEndExclusive());
+                yield new JavaNodeReplaceResult(updated, nodeType, methodName);
+            }
+            default -> throw new IllegalArgumentException("java_node_replace 的 nodeType 不支持：" + nodeType + "（请使用 class/method/statement）");
+        };
+    }
+
+    private static String replaceJavaMethodBody(String text, MethodBlock method, String newBody) {
+        String eol = detectEol(text);
+        String baseIndent = lineIndentAt(text, method.openBraceIndex());
+        String innerIndent = detectInnerIndent(text, method, baseIndent);
+        // 重新格式化方法体时尽量复用原文件换行风格和缩进层级，避免输出风格突变。
+        String replacement = formatJavaBody(newBody, eol, baseIndent, innerIndent);
+        return text.substring(0, method.openBraceIndex() + 1) + replacement + text.substring(method.bodyEndExclusive());
+    }
+
+    private static MethodBlock locateMethodBlock(String text, String className, String methodName, List<String> parameterTypes) {
+        // 先把注释/字符串擦成空白再匹配，避免命中字符串字面量里的“伪方法声明”。
+        String sanitized = sanitizeJavaForSearch(text);
+        int scopeStart = 0;
+        int scopeEnd = text.length();
+        if (className != null && !className.isBlank()) {
+            BlockRange classBlock = locateClassBlock(text, className);
+            scopeStart = classBlock.bodyStartInclusive();
+            scopeEnd = classBlock.bodyEndExclusive();
+        }
+
+        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(methodName) + "\\s*\\(([^)]*)\\)\\s*(?:throws\\s+[^\\{;]+)?\\{");
+        Matcher matcher = pattern.matcher(sanitized);
+        while (matcher.find()) {
+            if (matcher.start() < scopeStart || matcher.start() >= scopeEnd) {
+                continue;
+            }
+            int nameStart = matcher.start();
+            if (nameStart > 0) {
+                char previous = sanitized.charAt(nameStart - 1);
+                if (previous == '.' || Character.isJavaIdentifierPart(previous)) {
+                    continue;
+                }
+            }
+            int openBrace = matcher.end() - 1;
+            int closeBrace = findMatchingBrace(sanitized, openBrace);
+            if (closeBrace < 0) {
+                throw new IllegalArgumentException("定位 Java 方法失败：方法体大括号不匹配，method=" + methodName);
+            }
+            List<String> actualTypes = extractParameterTypes(matcher.group(1));
+            // 有重载时用参数类型再筛一轮，避免只按方法名命中错误重载。
+            if (parameterTypes != null && !parameterTypes.isEmpty() && !parameterTypesMatch(parameterTypes, actualTypes)) {
+                continue;
+            }
+            int declarationStart = findDeclarationStart(sanitized, matcher.start());
+            return new MethodBlock(declarationStart, openBrace, openBrace + 1, closeBrace, closeBrace + 1, methodName, className);
+        }
+        throw new IllegalArgumentException("未找到 Java 方法：" + methodName + (className == null ? "" : "（class=" + className + "）"));
+    }
+
+    private static BlockRange locateClassBlock(String text, String className) {
+        String sanitized = sanitizeJavaForSearch(text);
+        Pattern pattern = Pattern.compile("\\b(class|interface|enum|record)\\s+" + Pattern.quote(className) + "\\b");
+        Matcher matcher = pattern.matcher(sanitized);
+        if (!matcher.find()) {
+            throw new IllegalArgumentException("未找到 Java 类/接口/枚举/record：" + className);
+        }
+        int openBrace = sanitized.indexOf('{', matcher.end());
+        if (openBrace < 0) {
+            throw new IllegalArgumentException("定位 Java 类失败：未找到类体开始大括号，class=" + className);
+        }
+        int closeBrace = findMatchingBrace(sanitized, openBrace);
+        if (closeBrace < 0) {
+            throw new IllegalArgumentException("定位 Java 类失败：类体大括号不匹配，class=" + className);
+        }
+        return new BlockRange(matcher.start(), openBrace, openBrace + 1, closeBrace + 1);
+    }
+
+    private static int findDeclarationStart(String sanitized, int from) {
+        int lineStart = lastLineBreakIndex(sanitized, from - 1) + 1;
+        int scan = lineStart;
+        int declarationStart = lineStart;
+        while (scan < from) {
+            int nextLineBreak = nextLineBreakIndex(sanitized, scan);
+            int lineEnd = (nextLineBreak < 0) ? sanitized.length() : nextLineBreak;
+            String line = sanitized.substring(scan, lineEnd);
+            if (!line.trim().isEmpty()) {
+                String trimmed = line.trim();
+                if (!trimmed.startsWith("@")) {
+                    declarationStart = scan + leadingWhitespace(line);
+                    break;
+                }
+                declarationStart = scan + leadingWhitespace(line);
+            }
+            if (nextLineBreak < 0) {
+                break;
+            }
+            scan = consumeLineBreak(sanitized, nextLineBreak);
+        }
+        return declarationStart;
+    }
+
+    private static String sanitizeJavaForSearch(String text) {
+        // 保留原始长度与换行位置，只把注释/字符串内容抹成空格，便于后续用原始索引回写。
+        StringBuilder sb = new StringBuilder(text.length());
+        int i = 0;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+            if (c == '"' && startsWith(text, i, "\"\"\"")) {
+                sb.append("   ");
+                i += 3;
+                while (i < text.length() && !startsWith(text, i, "\"\"\"")) {
+                    char ch = text.charAt(i);
+                    sb.append(ch == '\r' || ch == '\n' ? ch : ' ');
+                    i++;
+                }
+                if (i < text.length()) {
+                    sb.append("   ");
+                    i += 3;
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < text.length() && text.charAt(i + 1) == '/') {
+                sb.append("  ");
+                i += 2;
+                while (i < text.length()) {
+                    char ch = text.charAt(i);
+                    sb.append(ch == '\r' || ch == '\n' ? ch : ' ');
+                    i++;
+                    if (ch == '\r' || ch == '\n') {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if (c == '/' && i + 1 < text.length() && text.charAt(i + 1) == '*') {
+                sb.append("  ");
+                i += 2;
+                while (i < text.length()) {
+                    if (i + 1 < text.length() && text.charAt(i) == '*' && text.charAt(i + 1) == '/') {
+                        sb.append("  ");
+                        i += 2;
+                        break;
+                    }
+                    char ch = text.charAt(i);
+                    sb.append(ch == '\r' || ch == '\n' ? ch : ' ');
+                    i++;
+                }
+                continue;
+            }
+            if (c == '"') {
+                sb.append(' ');
+                i++;
+                boolean escaped = false;
+                while (i < text.length()) {
+                    char ch = text.charAt(i);
+                    sb.append(ch == '\r' || ch == '\n' ? ch : ' ');
+                    i++;
+                    if (!escaped && ch == '"') {
+                        break;
+                    }
+                    escaped = !escaped && ch == '\\';
+                    if (ch != '\\') {
+                        escaped = false;
+                    }
+                }
+                continue;
+            }
+            if (c == '\'') {
+                sb.append(' ');
+                i++;
+                boolean escaped = false;
+                while (i < text.length()) {
+                    char ch = text.charAt(i);
+                    sb.append(ch == '\r' || ch == '\n' ? ch : ' ');
+                    i++;
+                    if (!escaped && ch == '\'') {
+                        break;
+                    }
+                    escaped = !escaped && ch == '\\';
+                    if (ch != '\\') {
+                        escaped = false;
+                    }
+                }
+                continue;
+            }
+            sb.append(c);
+            i++;
+        }
+        return sb.toString();
+    }
+
+    private static boolean startsWith(String text, int index, String token) {
+        return index >= 0 && index + token.length() <= text.length() && text.startsWith(token, index);
+    }
+
+    private static int findMatchingBrace(String text, int openBrace) {
+        int depth = 0;
+        for (int i = openBrace; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '{') {
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return -1;
+    }
+
+    private static List<String> extractParameterTypes(String parameterList) {
+        if (parameterList == null || parameterList.isBlank()) {
+            return List.of();
+        }
+        List<String> result = new ArrayList<>();
+        for (String rawParam : splitTopLevel(parameterList, ',')) {
+            String param = rawParam.trim();
+            if (param.isEmpty()) {
+                continue;
+            }
+            String cleaned = param.replaceAll("@[\\w.]+(?:\\s*\\([^)]*\\))?\\s*", " ")
+                    .replace("final ", " ")
+                    .replace("volatile ", " ")
+                    .replace("transient ", " ")
+                    .trim();
+            String[] tokens = cleaned.split("\\s+");
+            if (tokens.length <= 1) {
+                result.add(normalizeType(cleaned));
+                continue;
+            }
+            StringBuilder type = new StringBuilder();
+            for (int i = 0; i < tokens.length - 1; i++) {
+                if (type.length() > 0) {
+                    type.append(' ');
+                }
+                type.append(tokens[i]);
+            }
+            result.add(normalizeType(type.toString()));
+        }
+        return result;
+    }
+
+    private static List<String> splitTopLevel(String text, char delimiter) {
+        List<String> parts = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        int angle = 0;
+        int round = 0;
+        int square = 0;
+        // 只在顶层拆分，避免把泛型、数组、注解参数内部的逗号误拆开。
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            switch (c) {
+                case '<' -> angle++;
+                case '>' -> angle = Math.max(0, angle - 1);
+                case '(' -> round++;
+                case ')' -> round = Math.max(0, round - 1);
+                case '[' -> square++;
+                case ']' -> square = Math.max(0, square - 1);
+                default -> {
+                }
+            }
+            if (c == delimiter && angle == 0 && round == 0 && square == 0) {
+                parts.add(current.toString());
+                current.setLength(0);
+            } else {
+                current.append(c);
+            }
+        }
+        parts.add(current.toString());
+        return parts;
+    }
+
+    private static boolean parameterTypesMatch(List<String> expected, List<String> actual) {
+        if (expected.size() != actual.size()) {
+            return false;
+        }
+        for (int i = 0; i < expected.size(); i++) {
+            if (!normalizeType(expected.get(i)).equals(normalizeType(actual.get(i)))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String normalizeType(String type) {
+        if (type == null) {
+            return "";
+        }
+        return type.replaceAll("\\s+", "")
+                .replace("?extends", "?extends ")
+                .replace("?super", "?super ")
+                .replace("...", "[]");
+    }
+
+    private static String formatJavaBody(String newBody, String eol, String baseIndent, String innerIndent) {
+        String resolvedEol = (eol == null || eol.isEmpty()) ? "\n" : eol;
+        List<String> lines = splitToLines(trimLeadingAndTrailingBlankLines(newBody));
+        if (lines.isEmpty()) {
+            return resolvedEol + baseIndent;
+        }
+        // 方法体内部统一加一层内容缩进，结尾把闭括号对齐回声明所在列。
+        StringBuilder sb = new StringBuilder();
+        sb.append(resolvedEol);
+        for (int i = 0; i < lines.size(); i++) {
+            String line = lines.get(i);
+            if (!line.isEmpty()) {
+                sb.append(innerIndent).append(line.stripTrailing());
+            }
+            if (i < lines.size() - 1) {
+                sb.append(resolvedEol);
+            }
+        }
+        sb.append(resolvedEol).append(baseIndent);
+        return sb.toString();
+    }
+
+    private static String trimLeadingAndTrailingBlankLines(String text) {
+        if (text == null) {
+            return "";
+        }
+        List<String> lines = splitToLines(text);
+        int start = 0;
+        int end = lines.size() - 1;
+        while (start <= end && lines.get(start).isBlank()) {
+            start++;
+        }
+        while (end >= start && lines.get(end).isBlank()) {
+            end--;
+        }
+        if (start > end) {
+            return "";
+        }
+        return String.join("\n", lines.subList(start, end + 1));
+    }
+
+    private static String lineIndentAt(String text, int index) {
+        int lineStart = lastLineBreakIndex(text, index) + 1;
+        int i = lineStart;
+        while (i < text.length()) {
+            char c = text.charAt(i);
+            if (c != ' ' && c != '\t') {
+                break;
+            }
+            i++;
+        }
+        return text.substring(lineStart, i);
+    }
+
+    private static String detectInnerIndent(String text, MethodBlock method, String baseIndent) {
+        int i = method.bodyStart();
+        while (i < method.bodyEndExclusive()) {
+            char c = text.charAt(i);
+            if (c == '\r' || c == '\n') {
+                i = consumeLineBreak(text, i);
+                int start = i;
+                while (i < method.bodyEndExclusive()) {
+                    char ws = text.charAt(i);
+                    if (ws != ' ' && ws != '\t') {
+                        break;
+                    }
+                    i++;
+                }
+                if (i < method.bodyEndExclusive()) {
+                    char token = text.charAt(i);
+                    if (token != '\r' && token != '\n' && token != '}') {
+                        return text.substring(start, i);
+                    }
+                }
+                continue;
+            }
+            i++;
+        }
+        return baseIndent + "    ";
+    }
+
+    private static int lastLineBreakIndex(String text, int from) {
+        for (int i = Math.min(from, text.length() - 1); i >= 0; i--) {
+            char c = text.charAt(i);
+            if (c == '\n' || c == '\r') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int nextLineBreakIndex(String text, int from) {
+        for (int i = Math.max(0, from); i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '\n' || c == '\r') {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static int consumeLineBreak(String text, int index) {
+        if (index < 0 || index >= text.length()) {
+            return index;
+        }
+        if (text.charAt(index) == '\r' && index + 1 < text.length() && text.charAt(index + 1) == '\n') {
+            return index + 2;
+        }
+        return index + 1;
+    }
+
+    private static int leadingWhitespace(String line) {
+        int i = 0;
+        while (i < line.length()) {
+            char c = line.charAt(i);
+            if (c != ' ' && c != '\t') {
+                break;
+            }
+            i++;
+        }
+        return i;
+    }
+
+    private static int indexOfOccurrence(String text, String token, int fromIndex, int occurrence, boolean caseSensitive) {
+        if (token == null || token.isEmpty()) {
+            return fromIndex;
+        }
+        int cursor = Math.max(0, fromIndex);
+        int found = -1;
+        // occurrence 是 1-based：连续向后找第 N 次命中，适合重复锚点场景。
+        for (int i = 0; i < occurrence; i++) {
+            found = caseSensitive ? text.indexOf(token, cursor) : indexOfIgnoreCase(text.substring(cursor), token);
+            if (found < 0) {
+                return -1;
+            }
+            if (!caseSensitive) {
+                found += cursor;
+            }
+            cursor = found + token.length();
+        }
+        return found;
+    }
+
+    private static void collectPatchPreviews(List<FilePatchPreview> previews, String originalText, String updatedText, String eol, int maxPreviews, int context) {
+        if (Objects.equals(originalText, updatedText) || previews == null) {
+            return;
+        }
+        List<String> beforeLines = splitToLines(originalText);
+        List<String> afterLines = splitToLines(updatedText);
+        int prefix = commonPrefixLineCount(beforeLines, afterLines);
+        int beforeIndex = prefix;
+        int afterIndex = prefix;
+
+        while (beforeIndex < beforeLines.size() || afterIndex < afterLines.size()) {
+            ResyncPoint resync = findResyncPoint(beforeLines, afterLines, beforeIndex, afterIndex, 24);
+            int beforeEndExclusive = (resync == null) ? beforeLines.size() : resync.beforeIndex();
+            int afterEndExclusive = (resync == null) ? afterLines.size() : resync.afterIndex();
+            FilePatchPreview preview = buildPreviewSegment(beforeLines, afterLines, beforeIndex, beforeEndExclusive, afterIndex, afterEndExclusive, context, eol);
+            if (preview != null) {
+                previews.add(preview);
+                if (previews.size() >= maxPreviews) {
+                    return;
+                }
+            }
+            if (resync == null) {
+                return;
+            }
+            beforeIndex = resync.beforeIndex();
+            afterIndex = resync.afterIndex();
+            while (beforeIndex < beforeLines.size() && afterIndex < afterLines.size()
+                    && Objects.equals(beforeLines.get(beforeIndex), afterLines.get(afterIndex))) {
+                beforeIndex++;
+                afterIndex++;
+            }
+        }
+    }
+
+    private static FilePatchPreview buildPreviewSegment(
+            List<String> beforeLines,
+            List<String> afterLines,
+            int beforeStartDiff,
+            int beforeEndExclusive,
+            int afterStartDiff,
+            int afterEndExclusive,
+            int context,
+            String eol
+    ) {
+        if (beforeStartDiff >= beforeEndExclusive && afterStartDiff >= afterEndExclusive) {
+            return null;
+        }
+        int beforeStart = Math.max(0, beforeStartDiff - context);
+        int beforeEnd = Math.max(beforeStart - 1, Math.min(beforeLines.size() - 1, beforeEndExclusive - 1 + context));
+        int afterStart = Math.max(0, afterStartDiff - context);
+        int afterEnd = Math.max(afterStart - 1, Math.min(afterLines.size() - 1, afterEndExclusive - 1 + context));
+        return new FilePatchPreview(
+                beforeLines.isEmpty() ? null : beforeStart + 1,
+                beforeLines.isEmpty() || beforeEnd < beforeStart ? null : beforeEnd + 1,
+                snippetFromLines(beforeLines, beforeStart, beforeEnd, eol),
+                afterLines.isEmpty() ? null : afterStart + 1,
+                afterLines.isEmpty() || afterEnd < afterStart ? null : afterEnd + 1,
+                snippetFromLines(afterLines, afterStart, afterEnd, eol)
+        );
+    }
+
+    private static int commonPrefixLineCount(List<String> beforeLines, List<String> afterLines) {
+        int prefix = 0;
+        while (prefix < beforeLines.size() && prefix < afterLines.size()
+                && Objects.equals(beforeLines.get(prefix), afterLines.get(prefix))) {
+            prefix++;
+        }
+        return prefix;
+    }
+
+    private static ResyncPoint findResyncPoint(List<String> beforeLines, List<String> afterLines, int beforeIndex, int afterIndex, int lookahead) {
+        int bestCost = Integer.MAX_VALUE;
+        ResyncPoint best = null;
+        for (int i = beforeIndex; i < Math.min(beforeLines.size(), beforeIndex + lookahead); i++) {
+            for (int j = afterIndex; j < Math.min(afterLines.size(), afterIndex + lookahead); j++) {
+                if (!Objects.equals(beforeLines.get(i), afterLines.get(j))) {
+                    continue;
+                }
+                int cost = (i - beforeIndex) + (j - afterIndex);
+                if (cost < bestCost) {
+                    bestCost = cost;
+                    best = new ResyncPoint(i, j);
+                }
+            }
+        }
+        return best;
+    }
+
+    private static String snippetFromLines(List<String> lines, int start, int end, String eol) {
+        if (lines == null || lines.isEmpty() || end < start || start >= lines.size()) {
+            return null;
+        }
+        String resolvedEol = (eol == null || eol.isEmpty()) ? "\n" : eol;
+        return String.join(resolvedEol, lines.subList(start, Math.min(lines.size(), end + 1)));
+    }
+
+    private static <T> List<T> nullableList(List<T> values) {
+        return (values == null || values.isEmpty()) ? null : values;
+    }
+
+    private static FilePatchPreview firstPreview(List<FilePatchPreview> previews) {
+        return (previews == null || previews.isEmpty()) ? null : previews.getFirst();
+    }
+
+    private static String detectEol(String text) {
+        int idx = text.indexOf('\n');
+        if (idx < 0) {
+            idx = text.indexOf('\r');
+        }
+        if (idx < 0) {
+            return "\n";
+        }
+        if (text.charAt(idx) == '\r' && idx + 1 < text.length() && text.charAt(idx + 1) == '\n') {
+            return "\r\n";
+        }
+        return String.valueOf(text.charAt(idx));
+    }
+
+    private record BlockReplaceResult(String text, int replacedStart, int replacedEnd, boolean includeAnchors) {
+    }
+
+    private record OperationEffect(int replacements, int insertedLines, int deletedLines, String summary) {
+    }
+
+    private record PatchExecutionResult(
+            String rootId,
+            String path,
+            Path target,
+            boolean changed,
+            String expectedSha256,
+            String newSha256,
+            int operations,
+            int replacements,
+            int insertedLines,
+            int deletedLines,
+            byte[] newBytes,
+            List<String> summaries,
+            List<FilePatchPreview> previews,
+            List<String> warnings
+    ) {
+    }
+
+    private record PatchResultViewOptions(
+            boolean includeSummaries,
+            boolean includePreviews,
+            int maxPreviews,
+            int previewContextLines
+    ) {
+        private static PatchResultViewOptions of(Boolean includeSummaries, Boolean includePreviews, Integer maxPreviews, Integer previewContextLines) {
+            boolean summaries = Boolean.TRUE.equals(includeSummaries);
+            boolean previews = Boolean.TRUE.equals(includePreviews);
+            int previewCount = Math.max(1, Math.min(20, (maxPreviews == null) ? 3 : maxPreviews));
+            int contextLines = Math.max(0, Math.min(5, (previewContextLines == null) ? 1 : previewContextLines));
+            return new PatchResultViewOptions(summaries, previews, previewCount, contextLines);
+        }
+    }
+
+    private record ResyncPoint(int beforeIndex, int afterIndex) {
+    }
+
+    private record BlockRange(int startInclusive, int openBraceIndex, int bodyStartInclusive, int endExclusive) {
+        private int bodyEndExclusive() {
+            return endExclusive - 1;
+        }
+    }
+
+    private record MethodBlock(
+            int declarationStart,
+            int openBraceIndex,
+            int bodyStart,
+            int closeBraceIndex,
+            int endExclusive,
+            String methodName,
+            String className
+    ) {
+        private int bodyEndExclusive() {
+            return closeBraceIndex;
+        }
+    }
+
+    private record JavaMethodReplaceResult(String text, String className, String methodName) {
+    }
+
+    private record JavaNodeReplaceResult(String text, String nodeType, String nodeName) {
+    }
+
+    private static final class TextDocument {
+        private String text;
+        private String eol;
+        private boolean endsWithNewline;
+
+        private TextDocument(String text, String eol, boolean endsWithNewline) {
+            this.text = text;
+            this.eol = eol;
+            this.endsWithNewline = endsWithNewline;
+        }
+
+        private static TextDocument from(Path target, byte[] originalBytes, String originalText) {
+            boolean endsWithNewline = originalBytes.length > 0 && originalBytes[originalBytes.length - 1] == (byte) '\n';
+            return new TextDocument(originalText, detectEol(target), endsWithNewline);
+        }
+
+        private String text() {
+            return text;
+        }
+
+        private String eol() {
+            return eol;
+        }
+
+        private List<String> lines() {
+            return new ArrayList<>(splitToLines(text));
+        }
+
+        private void setText(String text) {
+            // 整体替换文本后同步刷新换行风格和“是否以换行结尾”的状态，保证后续行级操作一致。
+            this.text = text;
+            this.eol = detectEol(text);
+            this.endsWithNewline = text.endsWith("\n") || text.endsWith("\r");
+        }
+
+        private void setLines(List<String> lines) {
+            // 行级操作统一回写到同一个文档状态，避免多种 patch 类型之间状态不一致。
+            this.text = joinLines(lines, eol, endsWithNewline);
+        }
     }
 
     private int resolveLimit(Integer limit) {
@@ -3057,6 +4034,35 @@ public class FileMcpTools {
         }
         String text = v.asText();
         return (text == null || text.isBlank()) ? null : text;
+    }
+
+    private static boolean optionalBoolean(JsonNode node, String field, boolean defaultValue) {
+        JsonNode v = (node == null) ? null : node.get(field);
+        if (v == null || v.isNull()) {
+            return defaultValue;
+        }
+        return v.asBoolean(defaultValue);
+    }
+
+    private static List<String> optionalTextArray(JsonNode node, String field) {
+        JsonNode v = (node == null) ? null : node.get(field);
+        if (v == null || v.isNull()) {
+            return null;
+        }
+        if (!v.isArray()) {
+            throw new IllegalArgumentException("patch 格式错误：字段 " + field + " 必须是字符串数组");
+        }
+        List<String> values = new ArrayList<>();
+        for (JsonNode item : v) {
+            if (item == null || item.isNull()) {
+                continue;
+            }
+            String text = item.asText();
+            if (text != null) {
+                values.add(text);
+            }
+        }
+        return values;
     }
 
     private static int requiredPositiveInt(JsonNode node, String field) {

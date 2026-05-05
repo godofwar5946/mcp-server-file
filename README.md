@@ -12,5 +12,8 @@
 - `fs_read_file_range`：按字节范围读取（base64，用于分片拉取任意文件）
 - `fs_find_by_name`：按名称定位文件/目录（优先缓存，未命中或 refresh=true 时回退扫描并更新缓存）
 - `fs_search`：搜索文件/目录（返回匹配行号+片段，不返回整文件）
-- `fs_prepare_patch_file`：按规则生成补丁写入（正则替换/插入/删除/按行处理；不直接写入，需 confirm）
+- `fs_prepare_patch_file`：按规则生成补丁写入（支持整文件替换、锚点块替换、正则/按行处理、Java 方法体/类方法节点替换；返回多段修改上下文；不直接写入，需 confirm）
+- `fs_prepare_read_modify_write_file`：一次 prepare 内完成“读当前文本 -> 应用修改 -> 生成待确认写入”，减少多轮往返
+- `fs_apply_patch_file`：一次调用内完成“读当前文本 -> 应用 patch -> 校验旧版本 -> 原子写回”，不再需要 confirm
+- `fs_apply_read_modify_write_file`：一次调用内完成“读当前文本 -> 应用修改 -> 校验旧版本 -> 原子写回”
 - `fs_prepare_write_file` -> `fs_confirm_write_file`：两段式写入确认（confirm=true 才会真正写入）

@@ -26,6 +26,8 @@ import java.util.List;
  * @param insertedLines 插入的行数（跨操作累计）
  * @param deletedLines  删除的行数（跨操作累计）
  * @param summaries     每个操作的简要结果说明（便于快速确认）
+ * @param preview       兼容字段：首个修改前后预览片段
+ * @param previews      修改前后预览片段列表（适合多处分散修改）
  * @param warnings      风险提示/告警
  */
 public record FilePatchPrepareResult(
@@ -43,6 +45,8 @@ public record FilePatchPrepareResult(
         int insertedLines,
         int deletedLines,
         List<String> summaries,
+        FilePatchPreview preview,
+        List<FilePatchPreview> previews,
         List<String> warnings
 ) {
 }
